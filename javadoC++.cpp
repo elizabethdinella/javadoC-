@@ -20,9 +20,17 @@ using namespace clang::tooling;
 using namespace llvm;
 using namespace std;
 
-bool printDebug = true;
+int addCommentsToWrite(int lineno, const string& comment);
+bool printDebug = false;
+bool nodeDebug = printDebug && false;
+bool curFileDebug = printDebug && false;
 string inputFname;
+string inputFileBuffer = ""; 
+map<int, string> commentsToWrite;
+int lastLineNo;
+bool prevFunc = false;
 
+//TODO: FIX FOR HW3 and HW4 (classes), get rid of comments if empty
 
 class ASTMatcherVisitor : public RecursiveASTVisitor<ASTMatcherVisitor> {
 	public:
@@ -32,18 +40,57 @@ class ASTMatcherVisitor : public RecursiveASTVisitor<ASTMatcherVisitor> {
 
 		bool DeclHelper(Decl *D){
 			string fname;
-			if(!D || !isInCurFile(Context, D, fname)){ return false; }
+			if(!D || (!isInCurFile(Context, D, fname) && fname.size() > 0)){ return false; }
+			else if(fname.size() == 0) { return true; }
 
 			string nodeType = D->getDeclKindName();
 
-			if(printDebug) { cout << "decl: reached a " << nodeType << " node " << endl; }
+			
+			if(prevFunc && !isParentDecl(getParentIfExists(D), "Function") && !(nodeType == "ParmVar")){
+				prevFunc = false;
+				addCommentsToWrite(lastLineNo-1, "*/\n");
+				if(printDebug){ cerr << "decl ending comments: " << nodeType << " " 
+					<< "parent: " << getDeclParent(D, Context) << " " << endl; } 
+			}
 
-			if(nodeType == "Function"){
+
+			if(nodeType == "Function" || nodeType == "CXXConstructor" || nodeType == "CXXMethod"){
+				prevFunc = true;
+				string comment = "/*\n";
+
+				string sourceLoc = D->getLocStart().printToString(Context->getSourceManager());
+				int pos = sourceLoc.find(":");	
+				sourceLoc = sourceLoc.substr(pos+1);
+				pos = sourceLoc.find(":");
+				sourceLoc = sourceLoc.substr(0, pos);	
+
+				stringstream s(sourceLoc);
+				int lineno;
+				s >> lineno;
+				lastLineNo = lineno;
+
+				if(printDebug) { cerr << sourceLoc << " lineno " << lineno << endl; }
+
 				FunctionDecl* fd = (FunctionDecl*) D;
 				ArrayRef<ParmVarDecl*> params = fd->parameters();
 				ArrayRef<ParmVarDecl*>::iterator itr = params.begin();
-				for(itr; itr != params.end(); itr++){
-					cout << "@param\t" << (*itr)->getName().data() << endl;
+				for(; itr != params.end(); itr++){
+					comment += "* @param\t";
+					comment += (*itr)->getName().data();
+					comment += "\n";
+				}
+
+				if(!fd->hasBody()){
+					comment += "*/\n";
+				}
+
+				if(printDebug){ cerr << "adding params for function: " << fd->getNameInfo().getName().getAsString() << endl; }
+				addCommentsToWrite(lineno-1, comment);
+				if(printDebug){ cerr << "added params"  << endl; }
+
+			}else{
+				if(nodeDebug){
+					cerr << "node type: " << nodeType << endl;
 				}
 			}
 			return true;
@@ -58,25 +105,51 @@ class ASTMatcherVisitor : public RecursiveASTVisitor<ASTMatcherVisitor> {
 			return true;
 		}
 
+
 		bool StmtHelper(Stmt* S){
 			string fname;
-			if(!S || !isInCurFile(Context, S, fname)){ return false; }
+			string comment = "";
 
+			if(!S || (!isInCurFile(Context, S, fname) && fname.size() > 0)){ return false; }
+			else if(fname.size() == 0) { return true; }
+
+			
 			string nodeType = S->getStmtClassName();
 
-			if(printDebug) { cout << "stmt: reached a " << nodeType << " node " << endl; }
 
-			if(nodeType == "return"){
-				cout << "@return\t"<< endl;
-			}else if(nodeType == "CXXThrowExpr"){
-				cout << "@throws\t";
-			}else if(nodeType == "StringLiteral" && isParentStmt(S, "CXXThrowExpr")){
-				clang::StringLiteral* sl = (clang::StringLiteral*) S;
-				cout << sl->getString().data() << endl;
+			const Decl* declParent = getDeclParent(S, Context);
+			if(prevFunc && !isParentStmt(S, "Function") && !(declParent && declParent->getDeclKindName() == "ParmVar")){
+				prevFunc = false;
+				addCommentsToWrite(lastLineNo-1, "*/\n");
+				if(printDebug){ cerr << "stmt ending comments: " << nodeType << "for line: " << lastLineNo-1;}
 			}
 
+			if(nodeType == "ReturnStmt"){
+				ReturnStmt* rs = (ReturnStmt*) S;
+				comment += "* @return\t";
+				if(rs->getRetValue()){
+					comment += rs->getRetValue()->getStmtClassName();
+				}
+				comment += "\n";
+			}else if(nodeType == "CXXThrowExpr"){
+				comment += "* @throws\t";
+			}else if(nodeType == "StringLiteral" && isParentStmt(S, "CXXThrowExpr")){
+				clang::StringLiteral* sl = (clang::StringLiteral*) S;
+				comment += sl->getString().data();
+				comment += "\n";
+			}else{
+				if(nodeDebug){
+					cerr << "node type: " << nodeType << endl;
+				}
+			}
+
+			if(isParentStmt(S, "Function")){
+				addCommentsToWrite(lastLineNo-1, comment);
+			}
+
+
 			return true;
-		}             
+		}  
 
 		bool TraverseStmt(Stmt *S) {
 			StmtHelper(S);
@@ -87,49 +160,41 @@ class ASTMatcherVisitor : public RecursiveASTVisitor<ASTMatcherVisitor> {
 	private:
 		ASTContext *Context;	
 
+		const Decl* getParentIfExists(Decl* D){
+			const Decl* parent = getDeclParent(D, Context);
+			if(parent){
+				return parent;
+			}else{
+				return D;	
+			}
+		}
 
 		bool isInCurFile(ASTContext *Context, const Decl* D, string& filename){
-			if(printDebug) { cout << "decl: checking if in cur file" << endl; }
+			if(curFileDebug) { cerr << "decl: " << D->getDeclKindName() << " checking if in cur file" << endl; }
 
 			if(!D) { return false; }
-			
+
 			SourceManager &sm = Context->getSourceManager();
 			SourceLocation loc = D->getLocation();
-			if(printDebug) { cout << "decl: got loc" << endl; }
 			StringRef filenameRef = sm.getFilename(loc);
 			filename = filenameRef.str();
-			if(printDebug) { cout << "decl: got filename" << endl; }
-			
-			if(printDebug) { cout << filename << endl; }
-		
-			return filename == inputFname; 
 
-			/*
-			vector<string>::iterator fileItr = find(includeList.begin(), includeList.end(), filename);
-			bool ret = fileItr != includeList.end();
-			return ret;*/
+			if(curFileDebug) { cerr << filename << " : " << inputFname << endl; }
+			return filename == inputFname || filename == "input.cc"; 
+
 		}
 
 		bool isInCurFile(ASTContext *Context, const Stmt* S, string& filename){
-			if(printDebug) { cout << "stmt: checking if in cur file" << endl; }
+			if(curFileDebug) { cerr << "stmt: checking if in cur file" << endl; }
 
 			SourceManager &sm = Context->getSourceManager();
 			SourceLocation loc = S->getLocStart();
 			StringRef filenameRef = sm.getFilename(loc);
 			filename = filenameRef.str();
 
-			if(printDebug) { cout << filename << endl; }
+			if(curFileDebug) { cerr << filename << endl; }
 
-			return filename == inputFname;
-
-			/*
-			 vector<string>::iterator fileItr = find(includeList.begin(), includeList.end(), filename);
-			bool ret = fileItr != includeList.end();
-			if(debugPrint && S->getStmtClassName() == "CXXConstructExpr"){
-				cerr << "context is is current file: "  << ret << endl;
-
-			}
-			return ret;*/
+			return filename == inputFname || filename == "input.cc"; 
 		}
 
 
@@ -144,6 +209,9 @@ It can be a grandparent, great grand parent etc
 			if(S == NULL){
 				return false;
 			}
+
+
+			//if(printDebug){ cerr << S->getStmtClassName() << " : " << nodeToFind  << endl; }
 
 			//found the node we're looking for
 			if(strcmp(S->getStmtClassName(), nodeToFind.c_str()) == 0){
@@ -173,6 +241,8 @@ It can be a grandparent, great grand parent etc
 			if(D == NULL){
 				return false;
 			}
+
+			//if(printDebug){ cerr << D->getDeclKindName() << " : " << nodeToFind  << endl; }
 
 			//we found the node we're looking for
 			if(strcmp(D->getDeclKindName(), nodeToFind.c_str()) == 0){
@@ -256,8 +326,6 @@ It can be a grandparent, great grand parent etc
 			}
 			return ret;
 		}
-
-
 };
 
 //AST CONSUMER - an interface that provides actions on the AST
@@ -274,7 +342,6 @@ class astConsumer : public clang::ASTConsumer{
 	private:
 		//Declare a RecursiveASTVisitor
 		ASTMatcherVisitor Visitor;
-
 };
 
 
@@ -292,29 +359,81 @@ class ASTMatcherAction : public clang::ASTFrontendAction {
 };
 
 
+void writeComments(){
+	map<int, string>::reverse_iterator itr = commentsToWrite.rbegin();
+	while(itr != commentsToWrite.rend()){
+		inputFileBuffer.insert(itr->first, itr->second);
+		itr++;
+	}
+
+}
+
+int addCommentsToWrite(int lineno, const string& comment){
+	int count = 0;
+	size_t pos = -1;
+	while(count < lineno){
+		pos = inputFileBuffer.find("\n", pos+1);
+		if(pos == string::npos){
+			cerr << "error in lineno: " << lineno << "! only " << count << " lines" << endl;
+		}
+		count++;
+	}
+
+	if(commentsToWrite.find(pos+1) != commentsToWrite.end()){
+		commentsToWrite[pos+1] += comment;
+	}else{
+		commentsToWrite[pos+1] = comment;
+	}
+
+	return pos+1;
+}	
+
+void removeEmptyComments(){
+	map<int, string>::iterator itr = commentsToWrite.begin();
+	while(itr != commentsToWrite.end()){
+		if(itr->second == "/*\n*/\n"){
+			itr->second = "";
+		}
+		itr++;
+	}
+}
+
+
 
 int main(int argc, char** argv){
 
-	if (argc > 1) {
+	string temp;
 
-		inputFname = argv[1];
-
-		ifstream f(argv[1]);
-		if(!f.good()){
-			cerr << "can't open: " << argv[1] << endl;
-		}
-		stringstream buffer;
-		buffer << f.rdbuf();
-
-		if(printDebug) { cout << "running tool on code" << endl; }
-
-		clang::tooling::runToolOnCode(new ASTMatcherAction, buffer.str());
-
-		if(printDebug) { cout << "done running tool on code" << endl; }
-
-	}else{
-		cerr << "please provide an input file" << endl;
+	while(getline(cin, temp)){
+		inputFileBuffer += temp;
+		inputFileBuffer += "\n";
+		//reading text
 	}
+
+
+	if(printDebug) { cerr << inputFileBuffer << endl; }
+
+
+	stringstream buffer;
+	buffer << inputFileBuffer; 
+
+	if(printDebug) { cerr << "running tool on code" << endl; }
+
+	clang::tooling::runToolOnCode(new ASTMatcherAction, buffer.str());
+
+	if(printDebug){ cerr << commentsToWrite[lastLineNo-1] << endl; }
+	int index = addCommentsToWrite(lastLineNo-1, "");
+	if(commentsToWrite[index].find("*/") == string::npos){
+		if(printDebug){ cerr << "adding ending comments to line: " << lastLineNo-1 << endl; }
+		addCommentsToWrite(lastLineNo-1, "*/\n");
+	}
+
+	removeEmptyComments();
+
+	if(printDebug) { cerr << "done running tool on code" << endl; }
+
+	writeComments();
+	cout << inputFileBuffer;
 
 }
 
