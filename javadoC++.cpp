@@ -410,6 +410,7 @@ int main(int argc, char** argv){
 		//reading text
 	}
 
+	int* a = new int;
 
 	if(printDebug) { cerr << inputFileBuffer << endl; }
 
